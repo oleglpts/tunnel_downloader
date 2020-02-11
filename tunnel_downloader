@@ -1,0 +1,243 @@
+#!/usr/bin/python3
+
+import os
+import sys
+import time
+import site
+import shutil
+import urllib3
+import logging
+import requests
+import argparse
+import traceback
+from multiprocessing import cpu_count
+
+
+def get_parsed_response(url):
+    """
+
+    Get parsed html
+
+    :param url: URL
+    :type url: str
+    :return: parsed response
+    :rtype: BeautifulSoup
+
+    """
+    display = Display(visible=0, size=(800, 600))
+    display.start()
+    browser = webdriver.Firefox()
+    try:
+        browser.get(url)
+        time.sleep(3)
+    except WebDriverException as e:
+        error_handler(logger, e, url)
+        browser.quit()
+        display.stop()
+        return None
+    except Exception as e:
+        error_handler(logger, e, url)
+        browser.quit()
+        display.stop()
+        return None
+    try:
+        bs_object = BeautifulSoup(browser.page_source, "html.parser")
+    except TypeError as e:
+        error_handler(logger, e, url)
+        browser.quit()
+        display.stop()
+        return None
+    except ValueError as e:
+        error_handler(logger, e, url)
+        browser.quit()
+        display.stop()
+        return None
+    browser.quit()
+    display.stop()
+    return bs_object
+
+
+def get_logger(logger_name, logging_format, file_name):
+    """
+
+    Get logger with path 'file name'. If permission error, create log in /tmp
+
+    :param logger_name: logger name
+    :type logger_name: str
+    :param logging_format: log format
+    :type logging_format: str
+    :param file_name: log file name
+    :type file_name: str
+    :return: logger
+    :rtype: logging.Logger
+
+    """
+    path, prepared = '', True
+    for cat in file_name.split('/')[1:-1]:
+        path += '/%s' % cat
+        if not os.path.exists(path):
+            try:
+                os.mkdir(path)
+            except PermissionError:
+                prepared = False
+                break
+    if not prepared:
+        file_name = '/tmp/%s' % file_name.split('/')[-1]
+    logging.basicConfig(level=logging.INFO, format=logging_format)
+    log = logging.getLogger(logger_name)
+    handler = logging.FileHandler(file_name, encoding='utf8')
+    handler.setFormatter(logging.Formatter(logging_format))
+    log.addHandler(handler)
+    log.setLevel(level=logging.INFO)
+    logging.getLogger("requests").setLevel(logging.ERROR)
+    urllib3.disable_warnings()
+    return log
+
+
+def error_handler(log, error, message, sys_exit=False, debug_info=False):
+    """
+
+    Error handler
+
+    :param log: logger
+    :type log: logging.Logger
+    :param error: current exception
+    :type error: Exception or None
+    :param message: custom message
+    :type message: str
+    :param sys_exit: if True, sys.exit(1)
+    :type sys_exit: bool
+    :param debug_info: if True, output traceback
+    :type debug_info: bool
+
+    """
+    if debug_info:
+        et, ev, tb = sys.exc_info()
+        log.error(
+            '%s error: %s\n%s\n--->\n--->\n' % (message, error, ''.join(traceback.format_exception(et, ev, tb))))
+    else:
+        log.error('%s error: %s' % (message, error))
+    if sys_exit:
+        log.error('Error termination')
+        exit(1)
+
+
+def http_request(method, url, exit_on_error=False, debug_info=False, **kwargs):
+    """
+
+    Request http(s)
+
+    :param method: request method
+    :type method: str
+    :param url: request url
+    :type url: str
+    :param exit_on_error: if True - exit on exception
+    :type exit_on_error: bool
+    :param debug_info: if True - traceback on exception
+    :type debug_info: bool
+    :param kwargs: key arguments
+    :return: response
+    :rtype: request.Response
+
+    """
+    resp = None
+    try:
+        resp = requests.request(method, url, **kwargs)
+        if resp.status_code != 200:
+            logger.error('request error: %s (%s)' % (resp.text if len(resp.text) <= 80 else 'long response',
+                                                     resp.reason))
+    except Exception as exc:
+        error_handler(logger, exc, 'request', sys_exit=exit_on_error, debug_info=debug_info)
+    return resp
+
+
+def download_file(event, args):
+    """
+
+    Download event
+
+    :param event: file descriptor
+    :param args:
+    :param parse
+
+    """
+    if not event.get('src', None):
+        return
+    extension = event['src'].split('.')[-1]
+    output_dir = '%s/%s/%s' % (
+        args.output_dir, event.get('artist', ''), event.get('album', '')) if not args.mix else args.output_dir
+    resp = http_request('get', event['src'], exit_on_error=True, verify=False, stream=True)
+    z_file = '%s/%s.%s' % (output_dir, event.get('title', ''), extension) if not args.mix else \
+        '%s/%s - %s - %s.%s' % (output_dir, event.get('artist', ''), event.get('album', ''), event.get('title', ''),
+                                extension)
+    if not os.path.isdir(output_dir):
+        os.makedirs(output_dir)
+    with open(z_file, 'wb') as f:
+        shutil.copyfileobj(resp.raw, f)
+    logger.info('stored file %s' % z_file)
+
+
+logger = get_logger(
+    'tunnel_downloader',
+    '%(levelname)-10s|%(asctime)s|%(process)d|%(thread)d| %(name)s --- %(message)s (%(filename)s:%(lineno)d)',
+    './%s.log' % 'tunnel_downloader'
+)
+
+
+if __name__ == '__main__':
+
+    # Arguments parse
+
+    parser = argparse.ArgumentParser(prog='tunnel_downloader.py')
+    parser.add_argument('-d', '--output_dir', help='output_dir', default='./music')
+    parser.add_argument('-e', '--environment', help='virtual environment', default='venv')
+    parser.add_argument('-m', '--mix', help='mix, no album', action='store_true')
+    parser.add_argument('-p', '--packages', help='packages dir',
+                        default='lib/python%s.%s/site-packages' % (sys.version_info.major, sys.version_info.minor))
+    parser.add_argument('-u', '--url', help='page URL', required=True)
+    parser.add_argument('-w', '--workers', help='workers count', default=cpu_count())
+    args = parser.parse_args()
+
+    # Activate virtual environment
+
+    if args.environment != "":
+        env_path = args.environment if args.environment[0:1] == "/" else os.getcwd() + "/" + args.environment
+        env_activation = env_path + '/' + 'bin/activate_this.py'
+        site.addsitedir(env_path + '/' + args.packages)
+        sys.path.append(os.getcwd())
+        try:
+            exec(open(env_activation).read())
+        except NotADirectoryError as e:
+            print('Virtual environment activation error')
+            exit(1)
+
+    # Start downloading
+
+    from bs4 import BeautifulSoup
+    from selenium import webdriver
+    from pyvirtualdisplay import Display
+    from concurrent.futures import ThreadPoolExecutor
+    from selenium.common.exceptions import WebDriverException
+    if not os.path.isdir(args.output_dir):
+        os.mkdir(args.output_dir)
+    logger.info('start downloading from %s' % args.url)
+    pool = ThreadPoolExecutor(max_workers=int(args.workers))
+    files = [
+        {
+            'file_id': audio.attrs.get('file_id', ''),
+            'artist': audio.attrs.get('artist', ''),
+            'album': audio.attrs.get('album', ''),
+            'title': audio.attrs.get('title', ''),
+            'src': audio.attrs.get('src', '')
+        } for audio in get_parsed_response(args.url).findAll('audio')
+    ]
+
+    # Download cycle
+
+    with pool:
+        for mp3 in files:
+            pool.submit(download_file, mp3, args)
+
+    # Stop download
+
+    logger.info('stop downloading from %s' % args.url)
